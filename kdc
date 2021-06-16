@@ -1,0 +1,298 @@
+#!/bin/bash
+#
+# Docker Containerized Kerberos KDC.
+#
+# This should be a pretty good start for building your own docker container
+# of a KDC.
+# Due to the fact that OSX docker is running in a VM, things get a bit
+# complicated.
+#
+# Latest version is located at: https://github.com/tillt/docker-kdc
+#
+
+# KDC hostname.
+KDC_HOST_NAME=${KDC_HOST_NAME:-'kdc'}
+# External KDC IP.
+KDC_NATHOST=${KDC_NATHOST:-'127.0.0.1'}
+# External KDC port.
+KDC_PORT=${KDC_PORT:-'48088'}
+# Config file.
+KDC_CONFIG=${KDC_CONFIG:-'kdc.json'}
+# Temmplates source dir.
+KDC_TEMPLATES_DIR=${KDC_TEMPLATES_DIR:-'templates'}
+
+# Default principal.
+KDC_PRINCIPAL=${KDC_PRINCIPAL:-'tillt'}
+# Default password.
+KDC_PASSWORD=${KDC_PASSWORD:-'matilda'}
+# Host requesting authentication.
+# Default derived from hostname -s.
+KDC_CLIENT=${KDC_CLIENT:-$(hostname -s)}
+# Kerberos domain name.
+# Default derived from fully qualified domain-name of the host.
+# Using backtick operator to prevent sublime's highlighting from freaking out.
+DEFAULT=`hostname -f | 							\
+	awk -F. '{$1="";OFS="." ; print $0 ; OFS=""}' |			\
+	sed 's/^.//'`
+KDC_DOMAIN_NAME=${KDC_DOMAIN_NAME:-$DEFAULT}
+
+# Try read and parse the setup from a JSON file.
+if [ -e $KDC_CONFIG ]; then
+	status=$(cat $KDC_CONFIG | jq 'has("ip")')
+	if [[ $status == "true" ]]; then
+		KDC_NATHOST=$(cat $KDC_CONFIG | 			\
+			jq '.ip' | 					\
+			sed -e 's/^"//'  -e 's/"$//')
+	fi
+	status=$(cat $KDC_CONFIG | jq 'has("port")')
+	if [[ $status == "true" ]]; then
+		KDC_PORT=$(cat $KDC_CONFIG | 				\
+			jq '.port' | 					\
+			sed -e 's/^"//'  -e 's/"$//')
+	fi
+	status=$(cat $KDC_CONFIG | jq 'has("domain")')
+	if [[ $status == "true" ]]; then
+		KDC_DOMAIN_NAME=$(cat $KDC_CONFIG | 			\
+			jq '.domain' | 					\
+			sed -e 's/^"//'  -e 's/"$//')
+	fi
+	status=$(cat $KDC_CONFIG | jq 'has("realm")')
+	if [[ $status == "true" ]]; then
+		KDC_REALM_NAME=$(cat $KDC_CONFIG | 			\
+			jq '.realm' | 					\
+			sed -e 's/^"//'  -e 's/"$//')
+	fi
+	status=$(cat $KDC_CONFIG | jq 'has("principals")')
+	if [[ $status == "true" ]]; then
+		OLD_IFS=$IFS
+		IFS=$'\n'
+		KDC_PRINCIPALS=($(cat $KDC_CONFIG | 			\
+			jq '.principals[] | .id+" "+.password'))
+		IFS=$OLD_IFS
+	fi
+fi
+
+DEFAULT=`echo $KDC_DOMAIN_NAME | awk '{print toupper($0)}'`
+# Kerberos realm name.
+# Default derived from KDC_DOMAIN_NAME.
+KDC_REALM_NAME=${KDC_REALM_NAME:-$DEFAULT}
+
+# If we did not get any principals from our configuration, render a default.
+if [ ${#KDC_PRINCIPALS[@]} -eq 0 ]; then
+	# Render a default principal/password array for allowing a simple setup.
+	KDC_PRINCIPALS=("$KDC_PRINCIPAL/$KDC_CLIENT.$KDC_DOMAIN_NAME@$KDC_REALM_NAME $KDC_PASSWORD")
+fi
+
+
+DOCKERIMAGE='tillt/docker-kdc:latest'
+CONTAINER='docker'
+CONTROL_VM='VBoxManage controlvm boot2docker-vm'
+GET_KDC_HOST="echo $KDC_NATHOST"
+
+# Adjust container in case of OSX.
+# No longer needed for most users because of Docker for Mac
+#if [[ $OSTYPE =~ darwin.+ ]]; then
+#	CONTAINER='boot2docker'
+#	GET_KDC_HOST='boot2docker ip'
+#fi
+
+
+# Start boot2docker if not running and create port forwarding rules for OSX.
+function prepareDocker {
+	if [[ $CONTAINER == "boot2docker" ]]; then
+		boot2docker status &> /dev/null || boot2docker init
+		if [[ `boot2docker status` == "poweroff" ]]; then
+			boot2docker up
+			setupPortForward
+		fi
+		`$(boot2docker shellinit)`
+	fi
+}
+
+
+# Port forwarding setup for OSX.
+function setupPortForward {
+	$CONTROL_VM natpf1 delete "$KDC_PORT/tcp" &> /dev/null
+	$CONTROL_VM natpf1 delete "$KDC_PORT/udp" &> /dev/null
+	$CONTROL_VM natpf1 "$KDC_PORT/tcp,tcp,$KDC_NATHOST,$KDC_PORT,,$KDC_PORT"
+	$CONTROL_VM natpf1 "$KDC_PORT/udp,udp,$KDC_NATHOST,$KDC_PORT,,$KDC_PORT"
+}
+
+
+# Port forwarding teardown for OSX.
+function deletePortForward {
+	$CONTROL_VM natpf1 delete "$KDC_PORT/tcp" &> /dev/null
+	$CONTROL_VM natpf1 delete "$KDC_PORT/udp" &> /dev/null
+}
+
+
+# Start docker container.
+# Also renders a temporary KDC configuration file and exports the keytab.
+function startDocker {
+	echo "Kerberos KDC container starting..."
+	docker run -d -h $KDC_HOST_NAME					\
+		-p $KDC_PORT:88	 					\
+		-p $KDC_PORT:88/udp 					\
+		--name=$KDC_HOST_NAME 					\
+		$DOCKERIMAGE
+
+	local KDC_HOST=`$GET_KDC_HOST`
+	echo ""
+	echo "Kerberos KDC now reachable at '$KDC_HOST:$KDC_PORT'"
+	echo ""
+
+	sed -e "s/HOST_NAME/$KDC_HOST:$KDC_PORT/g"			\
+		-e "s/DOMAIN_NAME/$KDC_DOMAIN_NAME/g" 			\
+		-e "s/REALM_NAME/$KDC_REALM_NAME/g"			\
+		"$KDC_TEMPLATES_DIR/krb5.conf" >krb5.conf
+
+	docker cp $KDC_HOST_NAME:/etc/docker-kdc/krb5.keytab .
+
+	echo "For using the KDC, make sure you use the following environment:"
+	echo "    export KRB5_CONFIG=$(pwd)/krb5.conf"
+	echo "    export KRB5_KTNAME=$(pwd)/krb5.keytab"
+	echo ""
+}
+
+
+# Stop docker container and remove the temporary KDC configuration file.
+function stopDocker {
+	docker stop $KDC_HOST_NAME &> /dev/null
+	docker rm $KDC_HOST_NAME &> /dev/null
+	if [[ $CONTAINER == "boot2docker" ]]; then
+		deletePortForward
+		[[ `boot2docker status` == "running" ]] && boot2docker down
+	fi
+	rm -f krb5.conf
+	rm -f krb5.keytab
+	echo "Kerberos KDC stopped and removed"
+}
+
+
+# Render docker container image.
+function buildImage {
+	local RENDER_PRINCIPAL="RUN kadmin -l add --password=PASSWORD --use-defaults PRINCIPAL"
+	local EXPORT_KEYTAB="RUN kadmin -l ext_keytab -k /etc/docker-kdc/krb5.keytab"
+
+	# Use a temporary file for the add principal directives.
+	# TODO(tillt): This seems unclean - find a better way.
+	local TEMP_PRINCIPALS="_principals.txt"
+	for principal in "${KDC_PRINCIPALS[@]}"
+	do
+		principal=$(echo $principal | sed -e 's=^"=='  -e 's="$==')
+		IFS=' ' read -ra principal <<< "$principal"
+		IFS=''
+
+		echo $(echo $RENDER_PRINCIPAL |		 	\
+		sed -e "s=PRINCIPAL=${principal[0]}=g"		\
+		-e "s=PASSWORD=${principal[1]}=g")		\
+		>>$TEMP_PRINCIPALS
+		EXPORT_KEYTAB+=$(echo " ${principal[0]}")
+	done
+
+	local DOCKER_FILE=$(<$KDC_TEMPLATES_DIR/Dockerfile)
+	local ADD_PRINCIPALS=$(<$TEMP_PRINCIPALS)
+
+	DOCKER_FILE=$(echo "${DOCKER_FILE//PRINCIPALS/$ADD_PRINCIPALS}")
+	DOCKER_FILE=$(echo "${DOCKER_FILE//REALM/$KDC_REALM_NAME}")
+	DOCKER_FILE=$(echo "${DOCKER_FILE//EXPORT_KEYTAB/$EXPORT_KEYTAB}")
+	echo $DOCKER_FILE > Dockerfile
+
+	rm -f $TEMP_PRINCIPALS
+
+	sed -e "s=HOST_NAME=$KDC_HOST_NAME=g" 				\
+		-e "s=DOMAIN_NAME=$KDC_DOMAIN_NAME=g" 			\
+		-e "s=REALM_NAME=$KDC_REALM_NAME=g"			\
+		"$KDC_TEMPLATES_DIR/krb5.conf" >krb5.conf
+
+	docker build -t $DOCKERIMAGE .
+	rm -f Dockerfile
+	rm -f krb5.conf
+}
+
+
+function testBoot2dockerActive {
+	boot2docker status &> /dev/null || boot2docker init
+	if [[ `boot2docker status` == "running" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+
+function testKdcReachable {
+	local HOST=$($GET_KDC_HOST)
+	echo -n "at $HOST:$KDC_PORT... "
+	echo $'\n' $'\n' $'\n' | 			\
+		telnet $HOST $KDC_PORT 2>/dev/null |	\
+		grep Connected >/dev/null
+	if [[ $? -eq 0 ]]; then
+		return 0
+	fi
+	return 1
+}
+
+
+case "$1" in
+	start)
+		prepareDocker
+		startDocker
+		;;
+	stop)
+		prepareDocker
+		stopDocker
+		;;
+	clean)
+		prepareDocker
+		docker rmi -f $DOCKERIMAGE
+		;;
+	build)
+		prepareDocker
+		buildImage
+		;;
+	shellinit)
+		echo "    export KRB5_CONFIG=$(pwd)/krb5.conf"
+		echo "    export KRB5_KTNAME=$(pwd)/krb5.keytab"
+		;;
+	test)
+		if [[ $CONTAINER == "boot2docker" ]]; then
+			echo -n "Checking boot2docker active... "
+			if testBoot2dockerActive; then
+				echo "ok"
+			else
+				echo "failed"
+				exit 1
+			fi
+		fi
+		echo -n "Trying to connect to KDC... "
+		if testKdcReachable; then
+			echo "ok"
+		else
+			echo "failed"
+			exit 1
+		fi
+		;;
+	config)
+		echo "System"
+		echo "    fqdn:      $(hostname -f)"
+		echo "KDC"
+		KDC_HOST=`$GET_KDC_HOST`
+		echo "    host:      $KDC_HOST"
+		echo "    port:      $KDC_PORT"
+		echo "Kerberos"
+		echo "    domain:    $KDC_DOMAIN_NAME"
+		echo "    realm:     $KDC_REALM_NAME"
+		for principal in "${KDC_PRINCIPALS[@]}"
+		do
+			principal=$(echo $principal | sed -e 's=^"=='  -e 's="$==')
+			OLD_IFS=$IFS
+			IFS=' ' read -ra principal <<< "$principal"
+			IFS=$OLD_IFS
+			echo "    principal: ${principal[0]}, password: ${principal[1]}"
+		done
+
+		;;
+	*)
+		echo "Usage: $0 start|stop|build|clean|config|test|shellinit"
+		;;
+esac
