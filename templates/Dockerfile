@@ -1,13 +1,13 @@
-FROM ubuntu:14.04
-MAINTAINER Till Toenshoff <@ttoenshoff>
+FROM centos:7
+MAINTAINER oassaghir
 
-ARG DEBIAN_FRONTEND=noninteractive
+LABEL Remarks="This is a dockerfile example for Centos system"
 
 ADD krb5.conf /etc/krb5.conf
 
 RUN echo package heimdal/realm string REALM | debconf-set-selections
-RUN apt-get -y update && \
-    apt-get -y install heimdal-kdc libsasl2-modules-gssapi-heimdal
+RUN yum -y update && \
+    yum -y install heimdal-kdc libsasl2-modules-gssapi-heimdal
 
 EXPOSE	88
 
